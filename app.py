@@ -101,7 +101,7 @@ Return ONLY valid JSON, no markdown:
 Rules: recommendation=STRONG BUY|BUY MORE|HOLD|REDUCE|SELL|URGENT SELL, risk=LOW|MEDIUM|HIGH|VERY HIGH|EXTREME, avgDownVerdict=SMART|NEUTRAL|MISTAKE, prices=numbers"""
 
     client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
-    msg    = client.messages.create(model="claude-sonnet-4-6", max_tokens=1500,
+    msg    = client.messages.create(model="claude-haiku-4-5-20251001", max_tokens=1500,
                                     messages=[{"role":"user","content":prompt}])
     m = re.search(r'\{[\s\S]*\}', msg.content[0].text)
     if not m: raise ValueError("JSON не найден")
