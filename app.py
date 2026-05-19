@@ -1,7 +1,12 @@
 import streamlit as st
-import anthropic
 import json
 import re
+
+try:
+    import anthropic
+    ANTHROPIC_OK = True
+except ImportError:
+    ANTHROPIC_OK = False
 
 try:
     import yfinance as yf
