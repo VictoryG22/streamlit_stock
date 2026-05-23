@@ -303,7 +303,7 @@ if not sel_res:
     for p in st.session_state.portfolio:
         r   = st.session_state.results.get(p["id"])
         mkt = get_market_data(p["ticker"]) if YFINANCE_OK else None
-        lp  = mkt["price"] if mkt else (r["currentPrice"] if r else None)
+        lp  = mkt["price"] if mkt else (r.get("currentPrice") if r else None)
         avg = avg_price(p["lots"])
         pl  = f'{"+" if lp and (lp-avg)/avg*100>=0 else ""}{(lp-avg)/avg*100:.1f}%' if lp and avg else "—"
         chg = f'{mkt["change_pct"]:+.2f}%' if mkt else "—"
@@ -332,12 +332,12 @@ avd  = r.get("avgDownVerdict", "NEUTRAL")
 rc   = REC_COLOR.get(rec,  "#00e5ff")
 rkc  = RISK_COLOR.get(risk, "#ffd700")
 avdc = AVD_COLOR.get(avd,  "#ffd700")
-pl   = (r["currentPrice"] - avg) / avg * 100 if avg > 0 else 0
+pl   = (r.get("currentPrice", avg) - avg) / avg * 100 if avg > 0 else 0
 plc  = "#a8ff3e" if pl >= 0 else "#ff3ea8"
 
 # заголовок
 st.markdown(
-    f'<h1><span style="color:#00e5ff">{r["ticker"]}</span> '
+    f'<h1><span style="color:#00e5ff">{r.get("ticker", pos["ticker"])}</span> '
     f'<span style="font-size:16px;color:#3a5070">{pos.get("sector","")}</span></h1>',
     unsafe_allow_html=True
 )
@@ -484,14 +484,14 @@ with tab2:
     )
 
     if r.get("currentPrice") and r.get("stopLoss") and r.get("targetBase"):
-        risk_a = r["currentPrice"] - r["stopLoss"]
-        rew_a  = r["targetBase"]   - r["currentPrice"]
+        risk_a = r.get("currentPrice", 0) - r.get("stopLoss", 0)
+        rew_a  = r.get("targetBase", 0) - r.get("currentPrice", 0)
         if risk_a > 0 and rew_a > 0:
             rr  = rew_a / risk_a
             rrc = "#a8ff3e" if rr >= 2 else "#ffd700" if rr >= 1 else "#ff3ea8"
             st.markdown(
-                f'**R/R:** <span style="color:#ff3ea8">-{risk_a/r["currentPrice"]*100:.1f}%</span> / '
-                f'<span style="color:#a8ff3e">+{rew_a/r["currentPrice"]*100:.1f}%</span> · '
+                f'**R/R:** <span style="color:#ff3ea8">-{risk_a/r.get("currentPrice",1)*100:.1f}%</span> / '
+                f'<span style="color:#a8ff3e">+{rew_a/r.get("currentPrice",1)*100:.1f}%</span> · '
                 f'<span style="color:{rrc};font-weight:700">{rr:.1f}:1</span>',
                 unsafe_allow_html=True
             )
