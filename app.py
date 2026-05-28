@@ -16,18 +16,13 @@ try:
 except ImportError:
     YFINANCE_OK = False
 
-# ════════════════════════════════════════════════════════
-# localStorage ↔ Python через st.text_area (скрытый)
-#
-# Как работает:
-#  1. st.text_area с key="ls_bridge" рендерится СКРЫТЫМ через CSS
-#  2. JS при загрузке читает localStorage и ВСТАВЛЯЕТ значение в этот textarea
-#  3. Streamlit видит изменение виджета → делает rerun → Python читает значение
-#  4. При сохранении Python кладёт JSON в session_state["ls_write"]
-#     → JS polling раз в 500мс видит флаг → пишет в localStorage
-# ════════════════════════════════════════════════════════
+try:
+    from streamlit_javascript import st_javascript
+    JS_OK = True
+except ImportError:
+    JS_OK = False
 
-LS_KEY = "speculator_v2"
+LS_KEY = "speculator_v3"
 
 DEFAULT_PORTFOLIO = [
     {"id":1,"ticker":"APPS","sector":"Ad Tech",
@@ -44,57 +39,70 @@ DEFAULT_PORTFOLIO = [
      "lots":[{"shares":500,"price":0.30}]},
 ]
 
-# ── инициализация session state ───────────────────────
+# ── session state ─────────────────────────────────────────
 def _init():
-    defs = {
-        "portfolio":          None,
-        "next_id":            10,
-        "results":            {},
-        "selected":           None,
-        "history":            {},
-        "portfolio_analysis": None,
-        "dark_mode":          True,
-        "ls_loaded":          False,   # флаг: данные из LS уже прочитаны
-        "ls_write_pending":   None,    # JSON-строка ожидающая записи в LS
-    }
-    for k, v in defs.items():
+    for k,v in {
+        "portfolio":None,"next_id":10,"results":{},"selected":None,
+        "history":{},"portfolio_analysis":None,"dark_mode":True,"ls_loaded":False,
+        "trades":{},   # {pos_id: [{"date","shares","sell_price","avg_cost","pnl","pnl_pct"}]}
+    }.items():
         if k not in st.session_state:
-            st.session_state[k] = v
+            st.session_state[k]=v
 _init()
 
-# ── скрытый CSS для textarea-моста ───────────────────
-st.markdown("""
-<style>
-/* скрываем textarea-мост, но оставляем его в DOM */
-div[data-testid="stTextArea"][aria-label="ls_bridge_area"] {
-    position: absolute !important;
-    width: 1px !important;
-    height: 1px !important;
-    overflow: hidden !important;
-    opacity: 0 !important;
-    pointer-events: none !important;
-    top: -9999px !important;
-}
-</style>
-""", unsafe_allow_html=True)
+# ── localStorage через streamlit-javascript ───────────────
+def ls_read():
+    """Читает localStorage. Возвращает строку или None."""
+    if not JS_OK: return None
+    val = st_javascript(f"localStorage.getItem('{LS_KEY}')")
+    if val and isinstance(val, str) and len(val) > 5:
+        return val
+    return None
 
-# ── textarea-мост (ДОЛЖЕН быть до любого st.stop()) ──
-raw_ls = st.text_area("ls_bridge_area", key="ls_bridge", label_visibility="hidden")
+def ls_write(portfolio, history, next_id, trades):
+    """Пишет в localStorage."""
+    if not JS_OK: return
+    payload = json.dumps({
+        "portfolio": portfolio,
+        "history":   history,
+        "trades":    trades,
+        "next_id":   next_id,
+        "saved_at":  datetime.now().isoformat(),
+    }, ensure_ascii=False)
+    safe = payload.replace("\\","\\\\").replace("`","\\`").replace("'","\\'")
+    st_javascript(f"localStorage.setItem('{LS_KEY}', '{safe}'); 1")
 
-# ── читаем localStorage при первом запуске ────────────
+def ls_clear():
+    if not JS_OK: return
+    st_javascript(f"localStorage.removeItem('{LS_KEY}'); 1")
+
+def save_to_ls():
+    ls_write(
+        st.session_state.portfolio,
+        st.session_state.history,
+        st.session_state.next_id,
+        st.session_state.trades,
+    )
+
+# ── загрузка при первом запуске ───────────────────────────
 if not st.session_state.ls_loaded:
-    if raw_ls and raw_ls.strip():
-        try:
-            loaded = json.loads(raw_ls)
-            port   = loaded.get("portfolio")
-            hist   = loaded.get("history", {})
-            nid    = loaded.get("next_id", 10)
-            if port and isinstance(port, list) and len(port) > 0:
-                st.session_state.portfolio = port
-                st.session_state.history   = {int(k): v for k, v in hist.items()}
-                st.session_state.next_id   = nid
-        except Exception:
-            pass
+    if JS_OK:
+        raw = ls_read()
+        if raw:
+            try:
+                loaded = json.loads(raw)
+                port = loaded.get("portfolio")
+                if port and isinstance(port, list) and len(port) > 0:
+                    st.session_state.portfolio = port
+                    st.session_state.history = {
+                        int(k): v for k, v in loaded.get("history", {}).items()
+                    }
+                    st.session_state.trades = {
+                        int(k): v for k, v in loaded.get("trades", {}).items()
+                    }
+                    st.session_state.next_id = loaded.get("next_id", 10)
+            except Exception:
+                pass
     if st.session_state.portfolio is None:
         st.session_state.portfolio = DEFAULT_PORTFOLIO
     st.session_state.ls_loaded = True
@@ -102,93 +110,19 @@ if not st.session_state.ls_loaded:
 if st.session_state.portfolio is None:
     st.session_state.portfolio = DEFAULT_PORTFOLIO
 
-# ── JS: читает localStorage → вставляет в textarea ───
-# и слушает флаг ls_write_pending → пишет в localStorage
-write_payload = ""
-if st.session_state.ls_write_pending:
-    safe = st.session_state.ls_write_pending.replace("\\", "\\\\").replace("`", "\\`")
-    write_payload = f"localStorage.setItem('{LS_KEY}', `{safe}`);"
-    st.session_state.ls_write_pending = None
-
-st.components.v1.html(f"""
-<script>
-(function() {{
-    var KEY = '{LS_KEY}';
-
-    // ── запись (если Python положил данные) ──
-    {write_payload}
-
-    // ── чтение при первом запуске ──
-    var stored = localStorage.getItem(KEY);
-    if (!stored) return;
-
-    // Ждём пока textarea появится в DOM родительского окна
-    function injectValue(attempt) {{
-        if (attempt > 40) return;
-        // Ищем textarea в родительском фрейме
-        var textareas = window.parent.document.querySelectorAll('textarea');
-        var target = null;
-        for (var i = 0; i < textareas.length; i++) {{
-            // Streamlit рендерит label рядом с textarea
-            var label = window.parent.document.querySelector('label[for="' + textareas[i].id + '"]');
-            if (label && label.textContent.trim() === 'ls_bridge_area') {{
-                target = textareas[i]; break;
-            }}
-        }}
-        if (!target) {{
-            // Запасной вариант: ищем по data-testid
-            var block = window.parent.document.querySelector('[aria-label="ls_bridge_area"] textarea');
-            if (block) target = block;
-        }}
-        if (!target) {{
-            setTimeout(function() {{ injectValue(attempt + 1); }}, 150);
-            return;
-        }}
-        // Проверяем — уже заполнен?
-        if (target.value && target.value.trim().length > 5) return;
-
-        // Вставляем значение через React synthetic event
-        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLTextAreaElement.prototype, 'value').set;
-        nativeInputValueSetter.call(target, stored);
-        target.dispatchEvent(new Event('input', {{ bubbles: true }}));
-    }}
-
-    injectValue(0);
-}})();
-</script>
-""", height=0)
-
-# ── функция сохранения ────────────────────────────────
-def save_to_ls():
-    payload = json.dumps({
-        "portfolio": st.session_state.portfolio,
-        "history":   st.session_state.history,
-        "next_id":   st.session_state.next_id,
-        "saved_at":  datetime.now().isoformat(),
-    }, ensure_ascii=False)
-    st.session_state.ls_write_pending = payload
-
-def clear_ls():
-    st.components.v1.html(f"""
-<script>localStorage.removeItem('{LS_KEY}');</script>
-""", height=0)
-
-# ════════════════════════════════════════════════════════
-# ТЕМА
-# ════════════════════════════════════════════════════════
+# ── тема ─────────────────────────────────────────────────
 if st.session_state.dark_mode:
-    BG,BG2,BORDER   = "#080b12","#0d1520","#1e2a3a"
-    TEXT,TEXT_DIM   = "#e8eaf0","#8899aa"
-    TEXT_MUTE       = "#3a5070"
-    LABEL_CSS       = "color:#3a5070"
-    SIDEBAR_BG      = "#0d1520"
+    BG,BG2,BORDER = "#080b12","#0d1520","#1e2a3a"
+    TEXT,TEXT_DIM  = "#e8eaf0","#8899aa"
+    TEXT_MUTE      = "#3a5070"
+    LABEL_CSS      = "color:#3a5070"
+    SIDEBAR_BG     = "#0d1520"
 else:
-    BG,BG2,BORDER   = "#f0f4f8","#ffffff","#c8d8e8"
-    TEXT,TEXT_DIM   = "#0d1a2a","#3a5070"
-    TEXT_MUTE       = "#8899aa"
-    LABEL_CSS       = "color:#8899aa"
-    SIDEBAR_BG      = "#e0e8f0"
+    BG,BG2,BORDER = "#f0f4f8","#ffffff","#c8d8e8"
+    TEXT,TEXT_DIM  = "#0d1a2a","#3a5070"
+    TEXT_MUTE      = "#8899aa"
+    LABEL_CSS      = "color:#8899aa"
+    SIDEBAR_BG     = "#e0e8f0"
 
 st.markdown(f"""
 <style>
@@ -202,12 +136,12 @@ section[data-testid="stSidebar"]{{background-color:{SIDEBAR_BG};}}
 .label{{{LABEL_CSS};font-size:10px;text-transform:uppercase;letter-spacing:1px;}}
 p,li,span{{color:{TEXT};}}
 .stAlert p{{color:inherit!important;}}
+/* скрываем все iframes от st_javascript */
+iframe[height="0"]{{display:none!important;}}
 </style>
 """, unsafe_allow_html=True)
 
-# ════════════════════════════════════════════════════════
-# HELPERS
-# ════════════════════════════════════════════════════════
+# ── helpers ───────────────────────────────────────────────
 def avg_price(lots):
     sh=sum(l["shares"] for l in lots)
     return sum(l["shares"]*l["price"] for l in lots)/sh if sh>0 else 0
@@ -241,20 +175,34 @@ def get_market_data(ticker, period="3mo"):
 def analyze_stock(pos, mkt=None):
     avg=avg_price(pos["lots"]); sh=total_shares(pos["lots"]); cost=total_cost(pos["lots"])
     pl_pct=((mkt["price"]-avg)/avg*100) if mkt and avg>0 else None
-    ad_count=len(pos["lots"])
-    highest_buy=max(l["price"] for l in pos["lots"])
-    avg_down_pct=((highest_buy-avg)/highest_buy*100) if ad_count>1 else 0
+    ad=len(pos["lots"]); hb=max(l["price"] for l in pos["lots"])
+    adp=((hb-avg)/hb*100) if ad>1 else 0
     mf=""
     if mkt:
-        mf=f"\nREAL MARKET DATA:\n- Current price: ${mkt['price']}\n- Change today: {mkt['change_pct']:+.2f}%\n- 52w High: ${mkt['high_52w']} | 52w Low: ${mkt['low_52w']}\n- Volume: {mkt['volume']:,}\n- P&L vs avg: {pl_pct:+.1f}%"
-    prompt=f"""Prop-desk trader. Analyze speculative position.
-STOCK: {pos["ticker"]} [{pos.get("sector","Unknown")}]
-POSITION: {sh} shares | Avg: ${avg:.4f} | Invested: ${cost:.2f}
-LOTS: {", ".join(f"Lot{i+1}: {l['shares']}sh@${l['price']}" for i,l in enumerate(pos["lots"]))}
-{f"Averaged down {ad_count}x, reduced avg by {avg_down_pct:.1f}%" if ad_count>1 else "Single entry."}{mf}
-Return ONLY valid JSON:
-{{"recommendation":"HOLD","risk":"HIGH","confidence":55,"delistingRisk":false,"dilutionRisk":"MEDIUM","avgDownVerdict":"NEUTRAL","avgDownReason":"one sentence","context":"2-3 sentences","speculatorTip":"trade plan","catalysts":["c1","c2"],"risks":["r1","r2"],"targetLow":0.00,"targetBase":0.00,"targetHigh":0.00,"stopLoss":0.00,"psychNote":"bias"}}
-recommendation=STRONG BUY|BUY MORE|HOLD|REDUCE|SELL|URGENT SELL, risk=LOW|MEDIUM|HIGH|VERY HIGH|EXTREME, avgDownVerdict=SMART|NEUTRAL|MISTAKE"""
+        mf=(f"\nREAL MARKET DATA:\n- Price: ${mkt['price']}\n- Change: {mkt['change_pct']:+.2f}%\n"
+            f"- 52w H/L: ${mkt['high_52w']}/${mkt['low_52w']}\n- P&L: {pl_pct:+.1f}%")
+    lots_str = ", ".join(
+        "L" + str(i+1) + ":" + str(l["shares"]) + "@$" + str(l["price"])
+        for i, l in enumerate(pos["lots"])
+    )
+    avg_note = f"Averaged {ad}x, avg down {adp:.1f}%" if ad > 1 else "Single entry."
+    json_schema = (
+        '{"recommendation":"HOLD","risk":"HIGH","confidence":55,"delistingRisk":false,'
+        '"dilutionRisk":"MEDIUM","avgDownVerdict":"NEUTRAL","avgDownReason":"one sentence",'
+        '"context":"2-3 sentences","speculatorTip":"trade plan","catalysts":["c1","c2"],'
+        '"risks":["r1","r2"],"targetLow":0.00,"targetBase":0.00,"targetHigh":0.00,'
+        '"stopLoss":0.00,"psychNote":"bias"}'
+    )
+    prompt = (
+        f"Prop trader. Analyze position.\n"
+        f"STOCK: {pos['ticker']} [{pos.get('sector','')}]\n"
+        f"POSITION: {sh}sh avg ${avg:.4f} invested ${cost:.2f}\n"
+        f"LOTS: {lots_str}\n"
+        f"{avg_note}{mf}\n"
+        f"Return ONLY JSON:\n{json_schema}\n"
+        f"recommendation=STRONG BUY|BUY MORE|HOLD|REDUCE|SELL|URGENT SELL "
+        f"risk=LOW|MEDIUM|HIGH|VERY HIGH|EXTREME avgDownVerdict=SMART|NEUTRAL|MISTAKE"
+    )
     client=anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     msg=client.messages.create(model="claude-haiku-4-5-20251001",max_tokens=1000,
                                messages=[{"role":"user","content":prompt}])
@@ -275,9 +223,11 @@ def analyze_portfolio_summary():
         avg=avg_price(p["lots"]); cost=total_cost(p["lots"])
         mkt=get_market_data(p["ticker"]) if YFINANCE_OK else None
         pl=((mkt["price"]-avg)/avg*100) if mkt and avg>0 else None
-        rows.append(f"{p['ticker']} [{p.get('sector','')}]: avg ${avg:.3f}, invested ${cost:.0f}"
-                    +(f", current ${mkt['price']}, P&L {pl:+.1f}%" if pl is not None else ""))
-    prompt=f"Portfolio risk manager. 3-4 sentences in Russian. Focus: overall risk, sector concentration, biggest concerns, one actionable suggestion.\nPORTFOLIO:\n{chr(10).join(rows)}\nRussian only, plain text."
+        rows.append(f"{p['ticker']} [{p.get('sector','')}]: avg ${avg:.3f}, ${cost:.0f}"
+                    +(f", now ${mkt['price']}, P&L {pl:+.1f}%" if pl is not None else ""))
+    prompt=(f"Portfolio risk manager. 3-4 sentences in Russian. "
+            f"Overall risk, sector concentration, main concern, one action.\n"
+            f"PORTFOLIO:\n{chr(10).join(rows)}\nRussian only, plain text.")
     client=anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     msg=client.messages.create(model="claude-haiku-4-5-20251001",max_tokens=300,
                                messages=[{"role":"user","content":prompt}])
@@ -287,34 +237,31 @@ def analyze_portfolio_summary():
 # SIDEBAR
 # ════════════════════════════════════════════════════════
 with st.sidebar:
-    c_logo,c_theme=st.columns([3,1])
-    with c_logo: st.markdown("## 📊 Портфель")
-    with c_theme:
+    cl,ct=st.columns([3,1])
+    with cl: st.markdown("## 📊 Портфель")
+    with ct:
         if st.button("☀️" if st.session_state.dark_mode else "🌙",key="theme_btn"):
             st.session_state.dark_mode=not st.session_state.dark_mode; st.rerun()
 
     grand=sum(total_cost(p["lots"]) for p in st.session_state.portfolio)
     st.caption(f"{len(st.session_state.portfolio)} позиций · ${grand:.2f} вложено")
 
+    if JS_OK:
+        st.markdown(
+            f'<div style="background:{BG2};border:1px solid #a8ff3e44;border-radius:6px;'
+            f'padding:5px 10px;font-size:11px;color:#a8ff3e;margin:4px 0">'
+            f'💾 Данные сохраняются в браузере</div>', unsafe_allow_html=True)
+    else:
+        st.warning("⚠ streamlit-javascript не установлен — данные не сохраняются")
+
     if st.session_state.selected is not None:
         if st.button("← Сводка",use_container_width=True,key="back_btn"):
             st.session_state.selected=None; st.rerun()
 
-    # ── статус ──
-    saved_ok = st.session_state.ls_write_pending is None
-    st.markdown(
-        f'<div style="background:{BG2};border:1px solid {"#a8ff3e44" if saved_ok else "#ffd70044"};'
-        f'border-radius:6px;padding:5px 10px;font-size:11px;'
-        f'color:{"#a8ff3e" if saved_ok else "#ffd700"};margin:4px 0">'
-        f'{"💾 Сохранено в браузере" if saved_ok else "⏳ Сохраняется..."}'
-        f'</div>', unsafe_allow_html=True)
-
-    if st.button("🗑 Сбросить данные браузера",use_container_width=True,key="clear_btn",
-                 help="Вернуть дефолтный портфель"):
-        clear_ls()
-        for k in ["portfolio","history","results","selected","portfolio_analysis"]:
+    if st.button("🗑 Сбросить данные",use_container_width=True,key="clear_btn"):
+        ls_clear()
+        for k in ["portfolio","history","results","selected","portfolio_analysis","ls_loaded"]:
             st.session_state.pop(k,None)
-        st.session_state.ls_loaded=False
         st.rerun()
 
     st.divider()
@@ -322,7 +269,7 @@ with st.sidebar:
     with st.expander("➕ Новая акция"):
         nt=st.text_input("Тикер",key="new_t",placeholder="GME").upper().strip()
         ns=st.text_input("Сектор",key="new_s",placeholder="Gaming")
-        if st.button("Добавить",use_container_width=True,key="add_pos_btn"):
+        if st.button("Добавить",use_container_width=True,key="add_btn"):
             if nt:
                 st.session_state.portfolio.append(
                     {"id":st.session_state.next_id,"ticker":nt,"sector":ns,"lots":[]})
@@ -344,13 +291,12 @@ with st.sidebar:
             pl_html=f'<span style="color:{clr}"> {"+" if pl>=0 else ""}{pl:.1f}%</span>'
         chg_html=""
         if mkt:
-            ct=mkt["change_pct"]; ctc="#a8ff3e" if ct>=0 else "#ff3ea8"
-            chg_html=f'<span style="color:{ctc};font-size:10px"> {"+" if ct>=0 else ""}{ct:.2f}%</span>'
+            ct2=mkt["change_pct"]; ctc="#a8ff3e" if ct2>=0 else "#ff3ea8"
+            chg_html=f'<span style="color:{ctc};font-size:10px"> {"+" if ct2>=0 else ""}{ct2:.2f}%</span>'
         rec_html=""
         if res:
             rc2=REC_COLOR.get(res.get("recommendation","HOLD"),"#00e5ff")
             rec_html=f'<br><span style="color:{rc2};font-size:10px">{REC_RU.get(res.get("recommendation",""),"")}</span>'
-
         bc="#00e5ff" if is_sel else BORDER; bw="2px" if is_sel else "1px"
         pr_html=f'<span style="color:#00e5ff;font-weight:700"> ${live}</span>' if live else ""
         st.markdown(
@@ -381,6 +327,66 @@ with st.sidebar:
                 if lsh>0 and lpr>0:
                     pos["lots"].append({"shares":lsh,"price":lpr})
                     save_to_ls(); st.rerun()
+
+        # ── продажа ──
+        if pos["lots"]:
+            with st.expander(f"💰 Продать {pos['ticker']}"):
+                avg_now = avg_price(pos["lots"])
+                max_sh  = int(total_shares(pos["lots"]))
+                sa,sb   = st.columns(2)
+                sell_sh = sa.number_input("Кол-во",min_value=0.0,max_value=float(max_sh),
+                                          step=1.0,key=f"ssh_{pos['id']}")
+                sell_pr = sb.number_input("Цена $",min_value=0.0,step=0.01,
+                                          key=f"spr_{pos['id']}")
+                if sell_sh > 0 and sell_pr > 0:
+                    trade_pnl = (sell_pr - avg_now) * sell_sh
+                    pnl_c = "#a8ff3e" if trade_pnl >= 0 else "#ff3ea8"
+                    st.markdown(
+                        f'<div style="text-align:center;font-size:13px">'
+                        f'P&L этой продажи: <span style="color:{pnl_c};font-weight:700">'
+                        f'{"+" if trade_pnl>=0 else ""}${trade_pnl:.2f}</span></div>',
+                        unsafe_allow_html=True)
+                if st.button(f"✅ Продать",key=f"sell_{pos['id']}",use_container_width=True):
+                    if sell_sh > 0 and sell_pr > 0 and sell_sh <= max_sh:
+                        # считаем P&L по средней цене входа
+                        trade_pnl     = (sell_pr - avg_now) * sell_sh
+                        trade_pnl_pct = (sell_pr - avg_now) / avg_now * 100 if avg_now > 0 else 0
+                        # сохраняем сделку
+                        trade_entry = {
+                            "date":      datetime.now().strftime("%d.%m.%Y %H:%M"),
+                            "ticker":    pos["ticker"],
+                            "shares":    sell_sh,
+                            "sell_price":sell_pr,
+                            "avg_cost":  round(avg_now, 4),
+                            "pnl":       round(trade_pnl, 2),
+                            "pnl_pct":   round(trade_pnl_pct, 2),
+                        }
+                        pid = pos["id"]
+                        if pid not in st.session_state.trades:
+                            st.session_state.trades[pid] = []
+                        st.session_state.trades[pid].insert(0, trade_entry)
+                        # списываем акции из лотов (FIFO)
+                        remaining = sell_sh
+                        new_lots  = []
+                        for lot in pos["lots"]:
+                            if remaining <= 0:
+                                new_lots.append(lot)
+                            elif lot["shares"] <= remaining:
+                                remaining -= lot["shares"]
+                            else:
+                                new_lots.append({"shares": lot["shares"] - remaining,
+                                                 "price":  lot["price"]})
+                                remaining = 0
+                        pos["lots"] = new_lots
+                        # если все акции проданы — удаляем позицию
+                        if not pos["lots"]:
+                            st.session_state.portfolio = [
+                                p for p in st.session_state.portfolio if p["id"] != pid]
+                            if st.session_state.selected == pid:
+                                st.session_state.selected = None
+                        save_to_ls(); st.rerun()
+                    else:
+                        st.error("Проверь количество и цену")
 
         b1,b2=st.columns([3,1])
         if b1.button(f"▶ Анализ {pos['ticker']}",key=f"an_{pos['id']}",use_container_width=True):
@@ -414,7 +420,7 @@ with st.sidebar:
         st.markdown(f"<hr style='border-color:{BORDER};margin:6px 0'>",unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════
-# ОСНОВНОЙ ЭКРАН
+# ГЛАВНАЯ ОБЛАСТЬ
 # ════════════════════════════════════════════════════════
 sel_id  = st.session_state.selected
 sel_pos = next((p for p in st.session_state.portfolio if p["id"]==sel_id),None)
@@ -440,6 +446,71 @@ if not sel_res:
                     "AI":REC_RU.get(r2.get("recommendation",""),"") if r2 else "—"})
     if tbl: st.dataframe(tbl,use_container_width=True,hide_index=True)
 
+    # ── БАЛАНС ───────────────────────────────────────────────
+    realized_pnl   = sum(t["pnl"] for trades in st.session_state.trades.values() for t in trades)
+    unrealized_pnl = 0.0
+    total_invested = 0.0
+    for p in st.session_state.portfolio:
+        if not p["lots"]: continue
+        avg = avg_price(p["lots"])
+        cost= total_cost(p["lots"])
+        total_invested += cost
+        mkt = get_market_data(p["ticker"]) if YFINANCE_OK else None
+        r2  = st.session_state.results.get(p["id"])
+        lp  = mkt["price"] if mkt else (r2.get("currentPrice") if r2 else None)
+        if lp and avg > 0:
+            unrealized_pnl += (lp - avg) * total_shares(p["lots"])
+
+    total_pnl = realized_pnl + unrealized_pnl
+    tc = "#a8ff3e" if total_pnl >= 0 else "#ff3ea8"
+    rc2= "#a8ff3e" if realized_pnl >= 0 else "#ff3ea8"
+    uc = "#a8ff3e" if unrealized_pnl >= 0 else "#ff3ea8"
+
+    st.markdown(f'<h3 style="color:{TEXT}">💼 Баланс</h3>', unsafe_allow_html=True)
+    b1,b2,b3,b4 = st.columns(4)
+    b1.markdown(
+        f'<div style="background:{BG2};border:1px solid {tc}33;border-radius:8px;padding:14px;text-align:center">'
+        f'<div class="label">Итог (реал.+нереал.)</div>'
+        f'<div style="color:{tc};font-size:22px;font-weight:700">{"+" if total_pnl>=0 else ""}${total_pnl:.2f}</div>'
+        f'</div>', unsafe_allow_html=True)
+    b2.markdown(
+        f'<div style="background:{BG2};border:1px solid {rc2}33;border-radius:8px;padding:14px;text-align:center">'
+        f'<div class="label">Реализовано (продажи)</div>'
+        f'<div style="color:{rc2};font-size:22px;font-weight:700">{"+" if realized_pnl>=0 else ""}${realized_pnl:.2f}</div>'
+        f'</div>', unsafe_allow_html=True)
+    b3.markdown(
+        f'<div style="background:{BG2};border:1px solid {uc}33;border-radius:8px;padding:14px;text-align:center">'
+        f'<div class="label">Нереализовано (сейчас)</div>'
+        f'<div style="color:{uc};font-size:22px;font-weight:700">{"+" if unrealized_pnl>=0 else ""}${unrealized_pnl:.2f}</div>'
+        f'</div>', unsafe_allow_html=True)
+    b4.markdown(
+        f'<div style="background:{BG2};border:1px solid {BORDER};border-radius:8px;padding:14px;text-align:center">'
+        f'<div class="label">Вложено сейчас</div>'
+        f'<div style="color:{TEXT};font-size:22px;font-weight:700">${total_invested:.2f}</div>'
+        f'</div>', unsafe_allow_html=True)
+
+    # ── история продаж ────────────────────────────────────────
+    all_trades = []
+    for pid, tlist in st.session_state.trades.items():
+        for t in tlist:
+            all_trades.append(t)
+    all_trades.sort(key=lambda x: x["date"], reverse=True)
+
+    if all_trades:
+        st.markdown(f'<h3 style="color:{TEXT}">📤 История продаж</h3>', unsafe_allow_html=True)
+        for t in all_trades:
+            pc = "#a8ff3e" if t["pnl"] >= 0 else "#ff3ea8"
+            st.markdown(
+                f'<div style="background:{BG2};border-left:4px solid {pc};border-radius:6px;'
+                f'padding:8px 14px;margin:4px 0;font-size:12px">'
+                f'<span style="color:{TEXT_MUTE}">{t["date"]}</span>  '
+                f'<span style="color:#00e5ff;font-weight:700">{t["ticker"]}</span>  '
+                f'<span style="color:{TEXT}">{int(t["shares"])}шт × ${t["sell_price"]}</span>  '
+                f'<span style="color:{TEXT_MUTE}">вход ${t["avg_cost"]}</span>  '
+                f'<span style="color:{pc};font-weight:700">{"+" if t["pnl"]>=0 else ""}${t["pnl"]:.2f} '
+                f'({"+" if t["pnl_pct"]>=0 else ""}{t["pnl_pct"]:.1f}%)</span>'
+                f'</div>', unsafe_allow_html=True)
+
     st.divider()
     ca1,ca2=st.columns([3,1])
     with ca1:
@@ -447,7 +518,7 @@ if not sel_res:
         st.caption("~$0.0003 · max 300 токенов")
     with ca2:
         if st.button("▶ Анализировать",use_container_width=True,key="pa_btn"):
-            with st.spinner("Анализирую портфель..."):
+            with st.spinner("Анализирую..."):
                 try:
                     st.session_state.portfolio_analysis={"text":analyze_portfolio_summary(),
                                                           "date":datetime.now().strftime("%d.%m.%Y %H:%M")}
@@ -469,7 +540,7 @@ if not sel_res:
             st.markdown(f'<span style="color:#00e5ff;font-weight:700">{p["ticker"]}</span>',unsafe_allow_html=True)
             for e in hist:
                 rc2=REC_COLOR.get(e.get("recommendation","HOLD"),"#00e5ff")
-                rru=REC_RU.get(e.get("recommendation","HOLD"),e.get("recommendation",""))
+                rru=REC_RU.get(e.get("recommendation","HOLD"),"")
                 pl2=e.get("pl_pct"); plc="#a8ff3e" if pl2 and pl2>=0 else "#ff3ea8"
                 pl_s=f'{"+" if pl2 and pl2>=0 else ""}{pl2:.1f}%' if pl2 is not None else "—"
                 st.markdown(
@@ -503,8 +574,8 @@ c1.markdown(
     unsafe_allow_html=True)
 th=""
 if "changeToday" in r:
-    ct=r["changeToday"]; ctc="#a8ff3e" if ct>=0 else "#ff3ea8"
-    th=f'<div style="color:{ctc};font-size:12px">{"+" if ct>=0 else ""}{ct:.2f}% сегодня</div>'
+    ct2=r["changeToday"]; ctc="#a8ff3e" if ct2>=0 else "#ff3ea8"
+    th=f'<div style="color:{ctc};font-size:12px">{"+" if ct2>=0 else ""}{ct2:.2f}% сегодня</div>'
 c2.markdown(
     f'<div style="background:{BG2};border:1px solid {BORDER};border-radius:8px;padding:14px;text-align:center">'
     f'<div class="label">Цена</div>'
@@ -588,7 +659,8 @@ with tab2:
             rr=rw/ra; rrc="#a8ff3e" if rr>=2 else "#ffd700" if rr>=1 else "#ff3ea8"
             st.markdown(f'R/R: <span style="color:#ff3ea8">-{ra/r["currentPrice"]*100:.1f}%</span> / '
                         f'<span style="color:#a8ff3e">+{rw/r["currentPrice"]*100:.1f}%</span> · '
-                        f'<span style="color:{rrc};font-weight:700">{rr:.1f}:1</span>',unsafe_allow_html=True)
+                        f'<span style="color:{rrc};font-weight:700">{rr:.1f}:1</span>',
+                        unsafe_allow_html=True)
     st.markdown(
         f'<div style="background:rgba(199,125,255,.08);border:1px solid #c77dff33;'
         f'border-radius:8px;padding:16px;color:#c77dff;line-height:1.8">'
@@ -636,7 +708,7 @@ with tab4:
 with tab5:
     hd=st.session_state.history.get(pos["id"],[])
     if not hd:
-        st.markdown(f'<p style="color:{TEXT_MUTE}">История пуста — запусти анализ.</p>',unsafe_allow_html=True)
+        st.markdown(f'<p style="color:{TEXT_MUTE}">История пуста.</p>',unsafe_allow_html=True)
     else:
         for e in hd:
             rc2=REC_COLOR.get(e.get("recommendation","HOLD"),"#00e5ff")
