@@ -1,15 +1,16 @@
 import streamlit as st
-import json, re
+import json, re, sys
 from datetime import datetime
 
 st.set_page_config(page_title="Speculator AI", page_icon="📈", layout="wide")
 
-# ── обязательные зависимости ──────────────────────────────
-_missing = []
+# ── зависимости ───────────────────────────────────────────
 try:
     import anthropic
-except Exception:
-    _missing.append("anthropic")
+    ANTHROPIC_OK = True
+except Exception as e:
+    ANTHROPIC_OK = False
+    _anthropic_err = str(e)
 
 try:
     import yfinance as yf
@@ -24,15 +25,10 @@ try:
 except Exception:
     JS_OK = False
 
-if _missing:
-    st.error(f"❌ Не установлены пакеты: {', '.join(_missing)}\n\nПроверь requirements.txt и перезапусти приложение на Streamlit Cloud.")
-    st.code("\n".join([
-        "streamlit==1.45.0",
-        "anthropic==0.102.0",
-        "yfinance==1.3.0",
-        "pandas==2.2.3",
-        "streamlit-javascript==0.1.5",
-    ]), language="text")
+if not ANTHROPIC_OK:
+    st.error("❌ Ошибка загрузки anthropic")
+    st.code(_anthropic_err)
+    st.info("Попробуй: Manage app → Reboot app")
     st.stop()
 
 LS_KEY = "speculator_v3"
